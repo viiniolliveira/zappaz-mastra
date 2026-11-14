@@ -64,14 +64,24 @@ export interface DeduplicationOptions {
   maxEntries?: number
 }
 
+/** Identificadores do webhook validado pelo SDK, usados para selecionar o agente. */
+export interface AgentResolverContext {
+  conversationId: string
+  sessionId: string
+}
+
+export type AgentIdResolver = (context: AgentResolverContext) => string | Promise<string>
+
 /** Configuração da integração. Crie apenas uma integração por instância do SDK Zappaz. */
 export interface ZappazMastraOptions {
   /** Instância autenticada do SDK. A integração registra handlers nela. */
   zappaz: Zappaz
   /** Instância Mastra com o agente já registrado; não exige servidor Mastra. */
   mastra: Mastra
-  /** ID do agente registrado no Mastra (não seu nome de exibição). */
-  agentId: string
+  /** ID registrado no Mastra ou função que seleciona o ID por execução/conversa.
+   * A função também é usada na gravação de histórico durante atendimento humano.
+   */
+  agentId: string | AgentIdResolver
   /** Janela de silêncio em milissegundos para agrupar textos por conversa/remetente.
    * Omitir desativa o debounce. Inteiro entre 1 e 2147483647.
    */
@@ -112,7 +122,9 @@ export interface ZappazMastraOptions {
 
 /** Conecta um agente existente aos webhooks Zappaz, com execução serial por conversa. */
 export class ZappazMastra {
-  private readonly agent: Agent
+  private readonly agent?: Agent
+  private readonly mastra: Mastra
+  private readonly agentId: ZappazMastraOptions['agentId']
   private readonly zappaz: Zappaz
   private readonly allowedConversationIds?: ReadonlySet<string>
   private readonly transcribeAudio?: ZappazMastraOptions['transcribeAudio']
@@ -175,7 +187,15 @@ export class ZappazMastra {
     )
     this.timeoutMessage = timeoutMessage
     this.queueFullMessage = queueFullMessage
-    this.agent = mastra.getAgentById(agentId)
+    if (typeof agentId !== 'string' && typeof agentId !== 'function') {
+      throw new Error('agentId must be a string or a function')
+    }
+    if (typeof agentId === 'string' && !agentId.trim()) {
+      throw new Error('agentId must be a non-empty string')
+    }
+    this.mastra = mastra
+    this.agentId = agentId
+    this.agent = typeof agentId === 'string' ? mastra.getAgentById(agentId) : undefined
     this.zappaz = zappaz
     this.transcribeAudio = transcribeAudio
     this.errorMessages = { ...errorMessages }
@@ -440,14 +460,31 @@ export class ZappazMastra {
     messages: MessageContext['message'][],
     role: 'user' | 'assistant',
   ): Promise<void> {
-    await this.runStage(ctx, 'memory', (signal) => saveConversationMessages({
-      agent: this.agent,
-      ctx,
-      messages,
-      role,
-      signal,
-      formatUserMessage: (message, text) => this.formatUserMessage(message, text),
-    }))
+    await this.runStage(ctx, 'memory', async (signal) => {
+      const agent = await this.resolveAgent(ctx, signal)
+      await saveConversationMessages({
+        agent,
+        ctx,
+        messages,
+        role,
+        signal,
+        formatUserMessage: (message, text) => this.formatUserMessage(message, text),
+      })
+    })
+  }
+
+  private async resolveAgent(ctx: MessageContext, signal?: AbortSignal): Promise<Agent> {
+    if (this.agent) return this.agent
+    const conversationId = ctx.message.conversationId
+    if (!conversationId) throw new Error('Message has no conversation ID')
+    const agentId = typeof this.agentId === 'function'
+      ? await this.agentId({ conversationId, sessionId: ctx.session.id })
+      : this.agentId
+    signal?.throwIfAborted()
+    if (typeof agentId !== 'string' || !agentId.trim()) {
+      throw new Error('agentId resolver must return a non-empty string')
+    }
+    return this.mastra.getAgentById(agentId)
   }
 
   private messageKey(sessionId: string, message: MessageContext['message']): string | undefined {
@@ -696,7 +733,8 @@ export class ZappazMastra {
     if (!conversationId) throw new Error('Message has no conversation ID')
 
     return this.runStage(ctx, 'generate', async (signal) => {
-      const memory = await this.agent.getMemory()
+      const agent = await this.resolveAgent(ctx, signal)
+      const memory = await agent.getMemory()
       signal?.throwIfAborted()
       const enabled = this.toolOptions.getConversationMessages || this.toolOptions.replyMessage
       const state = this.execution.getStore()
@@ -726,7 +764,7 @@ export class ZappazMastra {
       }) : undefined
 
       try {
-        const result = await this.agent.generate(input, {
+        const result = await agent.generate(input, {
           abortSignal: signal,
           ...(conversationTools && { toolsets: { zappaz: conversationTools.tools } }),
           ...(memory && {

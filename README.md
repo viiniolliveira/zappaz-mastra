@@ -73,7 +73,7 @@ Todas as propriedades e tipos exportados têm descrições para consulta no edit
 | --- | --- | --- |
 | `zappaz` | obrigatório | Instância configurada do SDK Zappaz Lite |
 | `mastra` | obrigatório | Instância com o agente registrado |
-| `agentId` | obrigatório | ID do agente, não seu nome de exibição |
+| `agentId` | obrigatório | ID do agente ou função síncrona/assíncrona que retorna o ID por conversa |
 | `debounceMs` | desabilitado | Agrupa textos após uma janela de silêncio; inteiro positivo em ms |
 | `timeoutMs` | `120000` | Prazo por execução, sem contar espera na fila |
 | `maxPendingMessages` | `1000` | Total de execuções e tarefas aguardando por instância |
@@ -116,6 +116,43 @@ const integration = new ZappazMastra({
 
 Os valores numéricos do exemplo são os padrões. Não há Redis nem banco obrigatório
 para filas ou deduplicação. O storage da memória do agente é configurado no Mastra.
+
+## Seleção dinâmica do agente
+
+Uma única integração pode encaminhar conversas para agentes diferentes:
+
+```ts
+const integration = new ZappazMastra({
+  zappaz,
+  mastra,
+  agentId: ({ conversationId, sessionId }) =>
+    conversationId === process.env.ZAPPAZ_OWNER_CONVERSATION_ID
+      ? 'zappaz-bot'
+      : 'secretario',
+})
+
+// Tanto o handler da integração quanto o do próprio SDK podem ser usados:
+app.post('/webhooks/zappaz', (c) => zappaz.handleWebhook(c.req.raw))
+```
+
+O callback recebe `AgentResolverContext` (`conversationId` e `sessionId`) e pode
+retornar `string` ou `Promise<string>`. Os tipos `AgentResolverContext` e
+`AgentIdResolver` são exportados pelo pacote. IDs fixos continuam aceitos.
+
+A seleção acontece dentro da fila e do prazo da execução, após autenticação,
+validação, filtros e deduplicação. O agente selecionado é usado para a geração,
+memória e tools de conversa daquela execução, sem alterar o agente de outras
+conversas concorrentes. Também é selecionado para gravar histórico durante pausas
+de atendimento humano. Um lote de debounce seleciona o agente uma vez.
+
+Retornos vazios, IDs não registrados ou exceções do callback seguem o tratamento
+de erro da etapa `generate` ou `memory`, sem fallback para outro agente.
+Mantenha o roteamento estável se quiser continuar usando a memória do mesmo agente
+ao longo da conversa. O callback não é um sinal de que uma resposta será enviada:
+ele também pode ser chamado apenas para registrar histórico.
+
+Crie a integração uma única vez, fora da rota. Não registre uma nova integração
+por mensagem na mesma instância do SDK.
 
 ## Imagens e áudio MP3
 

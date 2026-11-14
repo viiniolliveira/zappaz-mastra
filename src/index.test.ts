@@ -46,10 +46,12 @@ function setup(options: {
   downloadError?: Error
   downloadImage?: (signal?: AbortSignal) => Promise<{ data: { media: string; mimeType: string } }>
   downloadAudio?: (signal?: AbortSignal) => Promise<{ data: Uint8Array; headers: Headers }>
-} & Partial<Pick<ZappazMastraOptions, 'commandPrefix' | 'enableImages' | 'enableAudio' | 'errorMessages' | 'onError' | 'transcribeAudio' | 'timeoutMs' | 'maxPendingMessages' | 'deduplication' | 'timeoutMessage' | 'queueFullMessage'>> = {}) {
+} & Partial<Pick<ZappazMastraOptions, 'agentId' | 'commandPrefix' | 'enableImages' | 'enableAudio' | 'errorMessages' | 'onError' | 'transcribeAudio' | 'timeoutMs' | 'maxPendingMessages' | 'deduplication' | 'timeoutMessage' | 'queueFullMessage'>> = {}) {
   const handlers: Partial<Record<Context['message']['type'], (ctx: Context) => Promise<void>>> = {}
   let debounced!: (ctx: { session: Context['session']; event: object; messages: Context['message'][]; reply: Context['reply'] }) => Promise<void>
   const calls: string[] = []
+  const selected: string[] = []
+  const generatedBy: string[] = []
   const sdk = {
     onEvent() {},
     onMessage(type: Context['message']['type'], handler: (ctx: Context) => Promise<void>) { handlers[type] = handler },
@@ -68,8 +70,15 @@ function setup(options: {
   }
   new ZappazMastra({
     zappaz: sdk as unknown as ZappazMastraOptions['zappaz'],
-    mastra: { getAgentById: () => agent } as unknown as ZappazMastraOptions['mastra'],
-    agentId: 'agent',
+    mastra: { getAgentById: (id: string) => {
+      selected.push(id)
+      if (id === 'missing') throw new Error('Agent not found')
+      return { ...agent, async generate(input: unknown, opts: { abortSignal?: AbortSignal }) {
+        generatedBy.push(id)
+        return agent.generate(input, opts)
+      } }
+    } } as unknown as ZappazMastraOptions['mastra'],
+    agentId: options.agentId ?? 'agent',
     debounceMs: options.debounceMs,
     allowedConversationIds: options.allowedConversationIds,
     commandPrefix: options.commandPrefix,
@@ -84,8 +93,105 @@ function setup(options: {
     timeoutMessage: options.timeoutMessage,
     queueFullMessage: options.queueFullMessage,
   })
-  return { handlers, calls, debounce: (ctx: Parameters<typeof debounced>[0]) => debounced(ctx) }
+  return { handlers, calls, selected, generatedBy, debounce: (ctx: Parameters<typeof debounced>[0]) => debounced(ctx) }
 }
+
+describe('dynamic agent selection', () => {
+  test('fixed IDs are still resolved eagerly', async () => {
+    const s = setup({ agentId: 'fixed' })
+    expect(s.selected).toEqual(['fixed'])
+    await s.handlers.text!(context('text', 'owner', 'hello'))
+    expect(s.selected).toEqual(['fixed'])
+    expect(s.generatedBy).toEqual(['fixed'])
+  })
+
+  test('routes conversations without resolving at construction or mixing concurrent agents', async () => {
+    const pending = deferred<string>()
+    const received: unknown[] = []
+    const s = setup({ agentId: (ctx) => {
+      received.push(ctx)
+      return ctx.conversationId === 'owner' ? pending.promise : 'secretary'
+    } })
+    expect(s.selected).toEqual([])
+    const owner = s.handlers.text!(context('text', 'owner', 'owner-message'))
+    await s.handlers.text!(context('text', 'clinic', 'clinic-message'))
+    expect(s.generatedBy).toEqual(['secretary'])
+    pending.resolve('supervisor')
+    await owner
+    expect(s.generatedBy).toEqual(['secretary', 'supervisor'])
+    expect(received).toEqual([
+      { conversationId: 'owner', sessionId: 'session' },
+      { conversationId: 'clinic', sessionId: 'session' },
+    ])
+  })
+
+  test('selects once per debounce batch', async () => {
+    let selections = 0
+    const s = setup({ debounceMs: 10, agentId: async () => { selections++; return 'secretary' } })
+    await s.debounce({
+      session: { id: 'session' }, event: {},
+      messages: [context('text', 'clinic', 'one').message, context('text', 'clinic', 'two').message],
+      reply: async () => {},
+    })
+    expect(selections).toBe(1)
+    expect(s.generatedBy).toEqual(['secretary'])
+  })
+
+  test('does not select for filtered or duplicate messages', async () => {
+    let selections = 0
+    const s = setup({ allowedConversationIds: ['owner'], agentId: () => { selections++; return 'supervisor' } })
+    await s.handlers.text!(context('text', 'clinic', 'blocked'))
+    await s.handlers.text!(context('text', 'owner', 'hello'))
+    await s.handlers.text!(context('text', 'owner', 'hello'))
+    expect(selections).toBe(1)
+  })
+
+  test('routes enabled images and audio', async () => {
+    const s = setup({
+      agentId: async () => 'media-agent', enableImages: true, enableAudio: true,
+      transcribeAudio: async () => 'transcribed',
+    })
+    await s.handlers.image!(context('image', 'clinic', 'picture'))
+    await s.handlers.audio!(context('audio', 'clinic', 'voice'))
+    expect(s.generatedBy).toEqual(['media-agent', 'media-agent'])
+  })
+
+  for (const result of ['', '  ', undefined, 42, 'missing', new Error('resolver failed')]) {
+    test(`invalid selection ${String(result)} follows generate error handling without fallback agent`, async () => {
+      const stages: string[] = []
+      const s = setup({
+        agentId: (async () => {
+          if (result instanceof Error) throw result
+          return result
+        }) as ZappazMastraOptions['agentId'],
+        onError: ({ stage }) => { stages.push(stage) },
+      })
+      const ctx = context('text', 'owner', 'hello')
+      const replies: string[] = []
+      ctx.reply = async (text) => { replies.push(text) }
+      await s.handlers.text!(ctx)
+      expect(stages).toEqual(['generate'])
+      expect(s.generatedBy).toEqual([])
+      expect(replies).toEqual(['Não consegui responder. Por favor, tente novamente.'])
+    })
+  }
+
+  test('resolver time counts against execution timeout and never generates after expiry', async () => {
+    const pending = deferred<string>()
+    const stages: string[] = [], replies: string[] = []
+    const s = setup({ timeoutMs: 10, agentId: () => pending.promise, onError: ({ stage }) => { stages.push(stage) } })
+    const ctx = context('text', 'owner', 'hello')
+    const notice = deferred()
+    ctx.reply = async (text) => { replies.push(text); notice.resolve() }
+    const work = s.handlers.text!(ctx)
+    await notice.promise
+    pending.resolve('supervisor')
+    await work
+    expect(stages).toEqual(['timeout'])
+    expect(replies).toHaveLength(1)
+    expect(s.generatedBy).toEqual([])
+  })
+})
 
 describe('conversation serialization', () => {
   test('same conversation waits for generation and delivery; another conversation runs concurrently', async () => {

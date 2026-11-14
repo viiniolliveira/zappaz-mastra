@@ -3,6 +3,55 @@ import { Zappaz } from '@zappaz/zappaz-lite-sdk'
 import { ZappazMastra, type ZappazMastraOptions } from './index.js'
 
 describe('real SDK webhook dispatch', () => {
+  test('routes validated webhooks through one SDK and integration with a dynamic ID', async () => {
+    const sent: unknown[] = [], selected: string[] = [], generated: string[] = []
+    const zappaz = new Zappaz({
+      baseUrl: 'https://example.invalid', apiKey: 'test-key', sessionId: 'session',
+      webhookSecret: 'secret',
+      fetch: (async (_input: unknown, init?: RequestInit) => {
+        sent.push(JSON.parse(String(init?.body)))
+        return Response.json({ status: 'success' })
+      }) as typeof fetch,
+    })
+    new ZappazMastra({
+      zappaz,
+      mastra: { getAgentById: (id: string) => ({
+        async getMemory() { return undefined },
+        async generate() { generated.push(id); return { text: id } },
+      }) } as unknown as ZappazMastraOptions['mastra'],
+      agentId: async ({ conversationId }) => {
+        selected.push(conversationId)
+        return conversationId === 'owner' ? 'supervisor' : 'secretary'
+      },
+    })
+    const dispatch = (conversationId: string | null, secret = 'secret', sessionId = 'session') =>
+      zappaz.handleWebhook(new Request('https://example.invalid/webhook', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-zappaz-webhook-secret': secret },
+        body: JSON.stringify({
+          event: 'inbound-message.upsert', session: { id: sessionId, status: 'connected', jid: null },
+          payload: { message: {
+            id: `internal-${conversationId}`, messageId: `message-${conversationId}`,
+            conversationId, chatId: 'chat@s.whatsapp.net', remoteJid: null, lid: null,
+            timestamp: null, fromMe: false, isGroup: false, sender: { id: 'sender' },
+            type: 'text', text: 'hello',
+          } },
+        }),
+      }))
+    expect((await dispatch('owner', 'wrong')).status).toBe(401)
+    expect((await dispatch('owner', 'secret', 'wrong-session')).status).toBe(403)
+    expect((await dispatch(null)).status).toBe(204)
+    expect(selected).toEqual([])
+    expect((await dispatch('owner')).status).toBe(204)
+    expect((await dispatch('clinic')).status).toBe(204)
+    expect(selected).toEqual(['owner', 'clinic'])
+    expect(generated).toEqual(['supervisor', 'secretary'])
+    expect(sent).toEqual([
+      { number: 'chat@s.whatsapp.net', message: 'supervisor' },
+      { number: 'chat@s.whatsapp.net', message: 'secretary' },
+    ])
+  })
+
   test('records a human outbound and paused inbound, then generates after resume', async () => {
     const sent: Array<{ url: string; method: string | undefined; body: unknown }> = []
     const fetcher = (async (input: RequestInfo | URL, init?: RequestInit) => {

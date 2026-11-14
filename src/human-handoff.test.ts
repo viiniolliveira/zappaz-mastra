@@ -14,6 +14,7 @@ function gate<T>() {
 async function flush() { for (let i = 0; i < 30; i++) await Promise.resolve() }
 
 function setup(options: {
+  agentId?: ZappazMastraOptions['agentId']
   humanHandoff?: ZappazMastraOptions['humanHandoff']
   allowedConversationIds?: string[]
   maxPendingMessages?: number
@@ -29,6 +30,7 @@ function setup(options: {
   let debounce!: (ctx: { session: { id: string }; event: string; messages: Message[]; reply: (s: string) => Promise<void> }) => Promise<void>
   const replies: string[] = [], generated: unknown[] = [], saved: Array<{ id: string; role: string; threadId: string; resourceId: string; content: { parts: Array<{ text: string }> } }> = [], reports: string[] = [], downloads: string[] = []
   const threads = new Map<string, { resourceId: string }>()
+  const selected: string[] = []
   const memory = {
     async getThreadById({ threadId }: { threadId: string }) { return threads.get(threadId) },
     async createThread({ threadId, resourceId }: { threadId: string; resourceId: string }) { threads.set(threadId, { resourceId }) },
@@ -44,15 +46,34 @@ function setup(options: {
     async getMemory() { return options.memory ? memory : undefined },
     async generate(input: unknown, opts: { abortSignal?: AbortSignal; memory?: unknown }) { generated.push({ input, memory: opts.memory }); return options.generate ? options.generate(opts.abortSignal) : { text: 'answer' } },
   }
-  const integration = new ZappazMastra({ zappaz: sdk as unknown as ZappazMastraOptions['zappaz'], mastra: { getAgentById: () => agent } as unknown as ZappazMastraOptions['mastra'], agentId: 'agent', enableImages: true, ...options, onError: async (e) => { reports.push(e.stage); await options.onError?.(e) } })
+  const integration = new ZappazMastra({ zappaz: sdk as unknown as ZappazMastraOptions['zappaz'], mastra: { getAgentById: (id: string) => { selected.push(id); return agent } } as unknown as ZappazMastraOptions['mastra'], agentId: 'agent', enableImages: true, ...options, onError: async (e) => { reports.push(e.stage); await options.onError?.(e) } })
   function context(m: Message) { return { message: m, session: { id: 'session' }, event: 'inbound-message.upsert', reply: async (s: string) => { replies.push(s) } } }
-  return { integration, handlers, context, replies, generated, saved, reports, downloads,
+  return { integration, handlers, context, replies, generated, saved, reports, downloads, selected,
     emit: (kind: string, m: unknown) => event({ event: kind, session: { id: 'session' }, payload: { message: m } }),
     batch: (messages: Message[]) => debounce({ session: { id: 'session' }, event: 'inbound-message.upsert', messages, reply: async (s) => { replies.push(s) } }),
   }
 }
 
 describe('human handoff', () => {
+  test('dynamic routing selects the agent for paused history and resumed generation', async () => {
+    const s = setup({
+      agentId: async ({ conversationId }) => conversationId === 'owner' ? 'supervisor' : 'secretary',
+      memory: true, humanHandoff: { enabled: true },
+    })
+    expect(s.selected).toEqual([])
+    await s.emit('outbound-message.upsert', message('human', 'clinic', true))
+    const inbound = message('question', 'clinic')
+    await s.emit('inbound-message.upsert', inbound)
+    await s.handlers.text!(s.context(inbound))
+    expect(s.selected).toEqual(['secretary', 'secretary'])
+    expect(s.saved.map((m) => m.threadId)).toEqual(['clinic', 'clinic'])
+    expect(s.generated).toEqual([])
+    s.integration.resumeConversation('clinic')
+    await s.handlers.text!(s.context(message('next', 'clinic')))
+    await s.handlers.text!(s.context(message('hello', 'owner')))
+    expect(s.selected).toEqual(['secretary', 'secretary', 'secretary', 'supervisor'])
+  })
+
   test('validates durations, supports fractions, manual control and isolated expiry', () => {
     for (const pauseMinutes of [0, -1, NaN, Infinity, Number.MAX_VALUE]) expect(() => setup({ humanHandoff: { pauseMinutes } })).toThrow('pauseMinutes')
     const clock = spyOn(Date, 'now').mockReturnValue(100_000)
