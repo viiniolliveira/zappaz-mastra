@@ -1,6 +1,6 @@
 {
   "name": "@zappaz/zappaz-mastra",
-  "version": "0.1.0-beta.0",
+  "version": "0.1.0-beta.1",
   "description": "Integração entre agentes Mastra e WhatsApp via Zappaz Lite, com debounce, tools e atendimento humano.",
   "license": "MIT",
   "type": "module",
